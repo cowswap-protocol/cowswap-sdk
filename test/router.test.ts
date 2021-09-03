@@ -2,7 +2,7 @@ import invariant from 'tiny-invariant'
 import { ChainId, CurrencyAmount, ETHER, Pair, Percent, Route, Router, Token, TokenAmount, Trade, WETH } from '../src'
 import JSBI from 'jsbi'
 
-function checkDeadline(deadline: string[] | string): void {
+function checkDeadline(deadline: string[] | string | boolean): void {
   expect(typeof deadline).toBe('string')
   invariant(typeof deadline === 'string')
   // less than 5 seconds on the deadline

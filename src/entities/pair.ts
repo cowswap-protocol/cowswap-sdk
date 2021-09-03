@@ -20,12 +20,16 @@ import {
 import { sqrt, parseBigintIsh } from '../utils'
 import { InsufficientReservesError, InsufficientInputAmountError } from '../errors'
 import { Token } from './token'
+import { Path } from './path'
+
 
 let PAIR_ADDRESS_CACHE: { [token0Address: string]: { [token1Address: string]: string } } = {}
 
 export class Pair {
   public readonly liquidityToken: Token
   private readonly tokenAmounts: [TokenAmount, TokenAmount]
+  public readonly path01: Path | undefined
+  public readonly path10: Path | undefined
 
   public static getAddress(tokenA: Token, tokenB: Token): string {
     const tokens = tokenA.sortsBefore(tokenB) ? [tokenA, tokenB] : [tokenB, tokenA] // does safety checks
@@ -47,7 +51,13 @@ export class Pair {
     return PAIR_ADDRESS_CACHE[tokens[0].address][tokens[1].address]
   }
 
-  public constructor(tokenAmountA: TokenAmount, tokenAmountB: TokenAmount) {
+  public constructor(
+    tokenAmountA: TokenAmount, 
+    tokenAmountB: TokenAmount,
+    pathAB?: Path,
+    pathBA?: Path
+  ) 
+  {
     const tokenAmounts = tokenAmountA.token.sortsBefore(tokenAmountB.token) // does safety checks
       ? [tokenAmountA, tokenAmountB]
       : [tokenAmountB, tokenAmountA]
@@ -59,6 +69,32 @@ export class Pair {
       'Uniswap V2'
     )
     this.tokenAmounts = tokenAmounts as [TokenAmount, TokenAmount]
+
+    if(pathAB) {
+      if(tokenAmounts[0].token.equals(pathAB.tokenIn)){
+        this.path01 = pathAB
+        this.path10 = pathBA
+      } else {
+        this.path10 = pathAB
+        this.path01 = pathBA
+      }
+    } else if(pathBA) {
+      if(tokenAmounts[0].token.equals(pathBA.tokenIn)){
+        this.path01 = pathBA
+        this.path10 = pathAB
+      } else {
+        this.path10 = pathBA
+        this.path01 = pathAB
+      }
+    }
+
+    // if(tokenAmountA.token.sortsBefore(tokenAmountB.token)) {
+    //   this.path01 = pathAB?.tokenIn.equals(tokenAmountA.token) ? pathAB : undefined
+    //   this.path10 = pathBA
+    // } else {
+    //   this.path01 = pathBA
+    //   this.path10 = pathAB
+    // }
   }
 
   /**
@@ -120,13 +156,34 @@ export class Pair {
     return token.equals(this.token0) ? this.reserve0 : this.reserve1
   }
 
-  public getOutputAmount(inputAmount: TokenAmount): [TokenAmount, Pair] {
+  public ammCalcOutputAmount(inputAmount: TokenAmount, checkReserves: boolean): [TokenAmount, TokenAmount, TokenAmount] {
     invariant(this.involvesToken(inputAmount.token), 'TOKEN')
-    if (JSBI.equal(this.reserve0.raw, ZERO) || JSBI.equal(this.reserve1.raw, ZERO)) {
-      throw new InsufficientReservesError()
-    }
+    
     const inputReserve = this.reserveOf(inputAmount.token)
     const outputReserve = this.reserveOf(inputAmount.token.equals(this.token0) ? this.token1 : this.token0)
+
+    if(JSBI.equal(inputAmount.raw, ZERO)) {
+      if(checkReserves) {
+        throw new InsufficientInputAmountError();
+      }
+      return [
+        new TokenAmount(inputAmount.token.equals(this.token0) ? this.token1 : this.token0, ZERO),
+        inputReserve,
+        outputReserve
+      ]
+    }
+
+    if(JSBI.equal(this.reserve0.raw, ZERO) || JSBI.equal(this.reserve1.raw, ZERO)) {
+      if(checkReserves) {
+        throw new InsufficientReservesError()
+      }
+      return [
+        new TokenAmount(inputAmount.token.equals(this.token0) ? this.token1 : this.token0, ZERO),
+        inputReserve,
+        outputReserve
+      ]
+    }
+
     const inputAmountWithFee = JSBI.multiply(inputAmount.raw, FEES_NUMERATOR)
     const numerator = JSBI.multiply(inputAmountWithFee, outputReserve.raw)
     const denominator = JSBI.add(JSBI.multiply(inputReserve.raw, FEES_DENOMINATOR), inputAmountWithFee)
@@ -134,31 +191,175 @@ export class Pair {
       inputAmount.token.equals(this.token0) ? this.token1 : this.token0,
       JSBI.divide(numerator, denominator)
     )
-    if (JSBI.equal(outputAmount.raw, ZERO)) {
-      throw new InsufficientInputAmountError()
-    }
-    return [outputAmount, new Pair(inputReserve.add(inputAmount), outputReserve.subtract(outputAmount))]
+    return [outputAmount, inputReserve, outputReserve]
   }
 
-  public getInputAmount(outputAmount: TokenAmount): [TokenAmount, Pair] {
+  public getOutputAmount(inputAmount: TokenAmount): [TokenAmount, Pair] {
+
+    const path = inputAmount.token.equals(this.token0) ? this.path10 : this.path01
+
+    if(path === undefined) {
+      const [outputAmount, inputReserve, outputReserve] = this.ammCalcOutputAmount(inputAmount, true) 
+      return [
+        outputAmount, 
+        new Pair(
+          inputReserve.add(inputAmount), 
+          outputReserve.subtract(outputAmount),
+          this.path01,
+          this.path10
+        )
+      ]
+    }
+
+    const [outputAmount, inputReserve, outputReserve] = this.ammCalcOutputAmount(inputAmount, false)
+    const [dexOutputAmount, returnInputAmount, freshPath ] = path.getOutputAmount(inputAmount)
+    
+    // const [ path01, path10 ] = inputAmount.token.equals(this.token0) ? [this.path01, freshPath ] : [ freshPath, this.path10 ]
+
+    const [ path01, path10 ] = freshPath.tokenIn.equals(this.token0) ? [ freshPath, this.path10 ] : [ this.path01, freshPath ]
+
+
+    const [ammOutputAmount, ammInputReserve, ammOutputReserve] = this.ammCalcOutputAmount(returnInputAmount, false)
+
+    const totalInputAmount = dexOutputAmount.add(ammOutputAmount)
+
+    if(JSBI.equal(outputAmount.raw, ZERO)) {
+      if(JSBI.greaterThan(returnInputAmount.raw, ZERO)) {
+        throw new InsufficientReservesError()
+      }
+      return [
+        totalInputAmount, 
+        new Pair(
+          ammInputReserve.add(returnInputAmount), 
+          ammOutputReserve.subtract(ammOutputAmount),
+          path01,
+          path10
+        )
+      ]
+    } else {
+      if(totalInputAmount.greaterThan(outputAmount)) {
+        return [
+          totalInputAmount, 
+          new Pair(
+            ammInputReserve.add(returnInputAmount), 
+            ammOutputReserve.subtract(ammOutputAmount),
+            path01,
+            path10
+          )
+        ]
+      } else {
+        return [
+          outputAmount, 
+          new Pair(
+            inputReserve.add(inputAmount), 
+            outputReserve.subtract(outputAmount),
+            this.path01,
+            this.path10
+          )
+        ]
+      }
+    }
+  }
+
+  public ammCalcInputAmount(outputAmount: TokenAmount, checkReserves: boolean): [TokenAmount, TokenAmount, TokenAmount] {
     invariant(this.involvesToken(outputAmount.token), 'TOKEN')
+    
+    const outputReserve = this.reserveOf(outputAmount.token)
+    const inputReserve = this.reserveOf(outputAmount.token.equals(this.token0) ? this.token1 : this.token0)
+
+    if(JSBI.equal(outputAmount.raw, ZERO)) {
+      return [
+        new TokenAmount(outputAmount.token.equals(this.token0) ? this.token1 : this.token0, ZERO),
+        inputReserve,
+        outputReserve
+      ]
+    }
+
     if (
       JSBI.equal(this.reserve0.raw, ZERO) ||
       JSBI.equal(this.reserve1.raw, ZERO) ||
       JSBI.greaterThanOrEqual(outputAmount.raw, this.reserveOf(outputAmount.token).raw)
     ) {
-      throw new InsufficientReservesError()
+      if(checkReserves) {
+        throw new InsufficientReservesError()
+      }
+      return [
+        new TokenAmount(outputAmount.token.equals(this.token0) ? this.token1 : this.token0, ZERO),
+        inputReserve,
+        outputReserve
+      ]
     }
 
-    const outputReserve = this.reserveOf(outputAmount.token)
-    const inputReserve = this.reserveOf(outputAmount.token.equals(this.token0) ? this.token1 : this.token0)
     const numerator = JSBI.multiply(JSBI.multiply(inputReserve.raw, outputAmount.raw), FEES_DENOMINATOR)
     const denominator = JSBI.multiply(JSBI.subtract(outputReserve.raw, outputAmount.raw), FEES_NUMERATOR)
     const inputAmount = new TokenAmount(
       outputAmount.token.equals(this.token0) ? this.token1 : this.token0,
       JSBI.add(JSBI.divide(numerator, denominator), ONE)
     )
-    return [inputAmount, new Pair(inputReserve.add(inputAmount), outputReserve.subtract(outputAmount))]
+
+    return [inputAmount, inputReserve, outputReserve]
+  }
+
+
+  public getInputAmount(outputAmount: TokenAmount): [TokenAmount, Pair] {
+    const path = outputAmount.token.equals(this.token0) ? this.path01 : this.path10
+    if(path === undefined) {
+      const [inputAmount, inputReserve, outputReserve] = this.ammCalcInputAmount(outputAmount, true)
+      return [
+        inputAmount,
+        new Pair(
+          inputReserve.add(inputAmount),
+          outputReserve.subtract(outputAmount),
+          this.path01,
+          this.path10
+        )
+      ]
+    }
+
+    const [inputAmount, inputReserve, outputReserve] = this.ammCalcInputAmount(outputAmount, false)
+    const [dexInputAmount, returnOutputAmount, freshPath] = path.getInputAmount(outputAmount)
+
+    const [ path01, path10 ] = freshPath.tokenIn.equals(this.token0) ? [ freshPath, this.path10 ] : [ this.path01,freshPath]
+
+    const [ammInputAmount, ammInputReserve, ammOutputReserve] = this.ammCalcInputAmount(returnOutputAmount, false)
+    const totalInputAmount = dexInputAmount.add(ammInputAmount)
+
+    if(JSBI.equal(inputAmount.raw, ZERO)) {
+      if(JSBI.greaterThan(returnOutputAmount.raw, ZERO)) {
+        throw new InsufficientReservesError()
+      }
+      return [
+        totalInputAmount,
+        new Pair(
+          ammInputReserve.add(ammInputAmount),
+          ammOutputReserve.subtract(returnOutputAmount),
+          path01,
+          path10
+        )
+      ]
+    } else {
+      if(JSBI.greaterThan(totalInputAmount.raw, ZERO) && JSBI.lessThan(totalInputAmount.raw, inputAmount.raw)) {
+        return [
+          totalInputAmount,
+          new Pair(
+            ammInputReserve.add(ammInputAmount),
+            ammOutputReserve.subtract(returnOutputAmount),
+            path01,
+            path10
+          )
+        ]
+      } else {
+        return [
+          inputAmount,
+          new Pair(
+            inputReserve.add(inputAmount),
+            outputReserve.subtract(outputAmount),
+            this.path01,
+            this.path10
+          )
+        ]
+      }
+    }
   }
 
   public getLiquidityMinted(

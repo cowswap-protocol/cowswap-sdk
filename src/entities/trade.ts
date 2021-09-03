@@ -274,14 +274,16 @@ export class Trade {
       const pair = pairs[i]
       // pair irrelevant
       if (!pair.token0.equals(amountIn.token) && !pair.token1.equals(amountIn.token)) continue
-      if (pair.reserve0.equalTo(ZERO) || pair.reserve1.equalTo(ZERO)) continue
+      // if (pair.reserve0.equalTo(ZERO) || pair.reserve1.equalTo(ZERO)) continue
 
       let amountOut: TokenAmount
       try {
         ;[amountOut] = pair.getOutputAmount(amountIn)
       } catch (error) {
+        if (pair.reserve0.equalTo(ZERO) || pair.reserve1.equalTo(ZERO)) continue
+
         // input too low
-        if (error.isInsufficientInputAmountError) {
+        if (error.isInsufficientInputAmountError || error.isInsufficientReservesError) {
           continue
         }
         throw error
@@ -360,14 +362,16 @@ export class Trade {
     const tokenIn = wrappedCurrency(currencyIn, chainId)
     for (let i = 0; i < pairs.length; i++) {
       const pair = pairs[i]
+
       // pair irrelevant
       if (!pair.token0.equals(amountOut.token) && !pair.token1.equals(amountOut.token)) continue
-      if (pair.reserve0.equalTo(ZERO) || pair.reserve1.equalTo(ZERO)) continue
+      // if (pair.reserve0.equalTo(ZERO) || pair.reserve1.equalTo(ZERO)) continue
 
       let amountIn: TokenAmount
       try {
         ;[amountIn] = pair.getInputAmount(amountOut)
       } catch (error) {
+        if (pair.reserve0.equalTo(ZERO) || pair.reserve1.equalTo(ZERO)) continue
         // not enough liquidity in this pair
         if (error.isInsufficientReservesError) {
           continue
